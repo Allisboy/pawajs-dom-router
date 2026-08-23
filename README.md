@@ -1,11 +1,11 @@
-# Pawajs Router
+# Pawajs DOM Router
 
 A file-based client-side router for [Pawajs](https://pawajs.vercel.app/) applications.
 
 ## Installation
 
 ```bash
-npm install pawajs pawajs-router
+npm install pawajs pawajs-dom-router
 npm install -D vite pawajs-vite-plugin
 ```
 
@@ -16,7 +16,7 @@ Register the router plugin in `vite.config.js`:
 ```js
 import { defineConfig } from "vite"
 import { pawajsPlugin } from "pawajs-vite-plugin"
-import { pawaFileRoutes } from "pawajs-router/routePlugin"
+import { pawaFileRoutes } from "pawajs-dom-router/routePlugin"
 
 export default defineConfig({
   plugins: [
@@ -30,7 +30,7 @@ Use the generated routes with the router:
 
 ```js
 import { RegisterComponent, html, pawaStartApp } from "pawajs"
-import { Router, RoutePlugin, setRoute } from "pawajs-router"
+import { Router, RoutePlugin, setRoute } from "pawajs-dom-router"
 import { allRoutes } from "./routes/generated-routes.js"
 
 RoutePlugin()
@@ -62,7 +62,7 @@ src/routes/
 
 This produces `/`, `/about`, and `/users/:id`. Dynamic folder names use `[param]`; catch-all folders use `[...path]`. A `layout.js` wraps the routes below its directory. Use `404.js` or `not-found.js` for a not-found page.
 
-A page module exports one component. Named exports ending in `Page` are recommended:
+A page module exports one component or The last Component is used:
 
 ```js
 import { html } from "pawajs"
@@ -110,7 +110,7 @@ Use `useRouteData` inside a page or layout:
 
 ```js
 import { html } from "pawajs"
-import { useRouteData } from "pawajs-router"
+import { useRouteData } from "pawajs-dom-router"
 
 export const UserPage = () => {
   const { data, reload } = useRouteData()
@@ -143,7 +143,7 @@ Guard errors and denied navigation are handled by the router. A denied route ren
 
 ```js
 import { html } from "pawajs"
-import { useRoute } from "pawajs-router"
+import { useRoute } from "pawajs-dom-router"
 
 export const Navigation = () => {
   const { current } = useRoute()
@@ -163,7 +163,7 @@ Render an independent route slot with `parallel-route`:
 
 ```js
 import { html, RegisterComponent } from "pawajs"
-import { ParallelRoute } from "pawajs-router"
+import { ParallelRoute } from "pawajs-dom-router"
 
 RegisterComponent(ParallelRoute)
 
@@ -182,7 +182,7 @@ Register `RouteIntercepter` and `InterceptSlot` when a route should render insid
 
 ```js
 import { html, RegisterComponent } from "pawajs"
-import { InterceptSlot, RouteIntercepter } from "pawajs-router"
+import { InterceptSlot, RouteIntercepter } from "pawajs-dom-router"
 
 RegisterComponent(RouteIntercepter, InterceptSlot)
 
@@ -201,7 +201,7 @@ export const Layout = ({ children }) => html`
 Invalidate loader data after a mutation:
 
 ```js
-import { cache } from "pawajs-router"
+import { cache } from "pawajs-dom-router"
 
 cache.invalidate("/users/42", "users")
 cache.invalidateName("users")
@@ -219,8 +219,8 @@ import type {
   RouteDefinition,
   RouteLoader,
   RouteGuard
-} from "pawajs-router"
-import type { PawaFileRoutesOptions } from "pawajs-router/routePlugin"
+} from "pawajs-dom-router"
+import type { PawaFileRoutesOptions } from "pawajs-dom-router/routePlugin"
 ```
 
 Pawajs component props are getter-based. For example:
@@ -231,3 +231,10 @@ interface UserProps {
   children?: string
 }
 ```
+
+## License
+
+This project is open source and available under the [MIT License](LICENSE).
+
+Built with love for the Pawajs ecosystem. May this router help make building
+fast, expressive Pawajs applications a little more joyful.

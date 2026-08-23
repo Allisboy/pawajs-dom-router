@@ -9,10 +9,12 @@ import {
   useAsync,
   useInsert
 } from "pawajs"
-import { RouteReader } from "../routeReader"
+import { RouteReader } from "./routeReader"
 import { pawaWayRemover } from "pawajs/utils"
 import { RadixRouter } from "./radix"
 import { loadRouteData, runGuards } from "./Fetcher"
+import { ParallelRoute } from "./parallel-route"
+import { RouteIntercepter } from "./route-intercept"
 const AccessDeniedPage=()=>{
   return html `
     <div>Access denied</div>
@@ -519,3 +521,4 @@ const remover = async (
     await doSwap()
   }
 }
+RegisterComponent('RouteReader',RouteReader,'ParallelRoute',ParallelRoute,'RouteIntercepter',RouteIntercepter)
