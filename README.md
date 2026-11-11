@@ -1,240 +1,352 @@
-# Pawajs DOM Router
+# @pawajs/router
 
-A file-based client-side router for [Pawajs](https://pawajs.vercel.app/) applications.
+A router for Pawajs applications that supports client-side navigation and
+server-side rendering. Routes and layouts are declared with Pawajs components;
+the router also provides reactive location state, route guards, preload hooks,
+and document metadata helpers.
 
 ## Installation
 
 ```bash
-npm install pawajs pawajs-dom-router
-npm install -D vite pawajs-vite-plugin
+npm install pawajs @pawajs/router
 ```
 
-## Setup
+For file-based routes, install Vite as a development dependency:
 
-Register the router plugin in `vite.config.js`:
+```bash
+npm install -D vite
+```
+
+Add the router plugin to the Vite config. It generates the `~pages` virtual
+module, which the app entry passes to `FileRouter`:
 
 ```js
 import { defineConfig } from "vite"
-import { pawajsPlugin } from "pawajs-vite-plugin"
-import { pawaFileRoutes } from "pawajs-dom-router/routePlugin"
+import { pawaFileRouter } from "@pawajs/router/vite"
 
 export default defineConfig({
-  plugins: [
-    pawajsPlugin(),
-    pawaFileRoutes()
-  ]
+  plugins: [pawaFileRouter()],
 })
 ```
 
-Use the generated routes with the router:
+```js
+import pages from "~pages"
+import { FileRouter } from "@pawajs/router/filesystem"
+
+const App = () => html`
+  <router>
+    <file-router :routes="pages"></file-router>
+  </router>
+`
+```
+
+The default route directory is `src/pages`. Configure another directory with
+`pawaFileRouter({ pagesDir: "app/routes" })`. Vite is an optional peer
+dependency; apps that only use manually declared routes do not need it.
+
+## Setup
+
+Register `Router`, `Route`, and each page component with Pawajs. A route's
+`name` must match the registered component name that should render for it.
 
 ```js
-import { RegisterComponent, html, pawaStartApp } from "pawajs"
-import { Router, RoutePlugin, setRoute } from "pawajs-dom-router"
-import { allRoutes } from "./routes/generated-routes.js"
+import { html, pawaStartApp, RegisterComponent } from "pawajs"
+import { Router, Route } from "@pawajs/router"
 
-RoutePlugin()
-setRoute(allRoutes)
-RegisterComponent(Router)
+const Home = () => html`<h1>Home</h1>`
+const About = () => html`<h1>About</h1>`
 
-const App = () => html`<router></router>`
-RegisterComponent(App)
+const App = () => html`
+  <router>
+    <route path="/" name="home"></route>
+    <route path="/about" name="about"></route>
+  </router>
+`
+
+RegisterComponent(Router, Route, Home, About, App)
 pawaStartApp(document.querySelector("app"))
 ```
 
-The plugin generates `src/routes/generated-routes.js` by default.
+The `url` prop on `<router>` can supply an initial URL getter. Otherwise, the
+router starts from the current browser URL, or `/` during server rendering.
 
-## Route Files
+## Server-side rendering
 
-Routes are created from `page.js` files:
-
-```text
-src/routes/
-  layout.js
-  page.js
-  404.js
-  about/
-    page.js
-  users/
-    [id]/
-      page.js
-```
-
-This produces `/`, `/about`, and `/users/:id`. Dynamic folder names use `[param]`; catch-all folders use `[...path]`. A `layout.js` wraps the routes below its directory. Use `404.js` or `not-found.js` for a not-found page.
-
-A page module exports one component or The last Component is used:
+Use the router with `pawaServer` as part of the server render. Pass the request
+and response in the render context so route guards and metadata helpers can
+access them. The router records redirects on `req.pawaRedirect`; handle that
+after rendering and before sending the HTML. `injectHeadMarkup` adds metadata
+collected by `RouteTitle` and `MetaTag` to the document head.
 
 ```js
-import { html } from "pawajs"
+import { pawaServer } from "@pawajs/ssr"
+import { RegisterComponent } from "pawajs"
+import { injectHeadMarkup } from "@pawajs/router"
+import { App } from "./app.js"
 
-export const AboutPage = () => html`
-  <h1>About</h1>
+RegisterComponent(App)
+
+export const main = async (
+  { url, write, templateStart, templateEnd },
+  res,
+  req,
+) => {
+  let stream = ""
+  const setStream = (chunk) => {
+    if (write) {
+      if (res.headersSent) return
+      write(chunk)
+      res.flush?.()
+    } else {
+      stream += chunk
+    }
+  }
+
+  const template = "<div><app></app></div>"
+  try {
+    const isDevelopment = process.env.NODE_ENV !== "production"
+    const { render, batches } = pawaServer(
+      template,
+      { url, req, res },
+      true,
+      isDevelopment,
+      false,
+    )
+    const { hydrate, string } = await render()
+
+    if (req?.pawaRedirect && !res.headersSent) {
+      res.status(302).set("Location", req.pawaRedirect)
+      return
+    }
+
+    setStream(injectHeadMarkup(templateStart, req?.pawaHead))
+    setStream(string)
+
+    const [beforeScripts, afterScripts] = templateEnd.split("<!--script-->")
+    setStream(`<script type="application/json" id="hydrate">${JSON.stringify(hydrate)}</script>`)
+    setStream(beforeScripts)
+    await batches(setStream)
+    setStream(afterScripts)
+    if (!write) return stream
+  } catch (error) {
+    console.error("SSR render failed", error)
+    throw error
+  }
+}
+```
+
+## Routes and layouts
+
+Use `:param` for a dynamic path segment and `*name` or `:...name` for a
+catch-all segment. `useRoute()` exposes the matched params and the current
+route:
+
+```js
+import { html, RegisterComponent } from "pawajs"
+import { useRoute } from "@pawajs/router"
+
+const User = () => {
+  const { params } = useRoute()
+  return html`<h1>User @{params.value.id}</h1>`
+}
+
+RegisterComponent(User)
+```
+
+Routes can be nested under a route marked as a layout. The layout component
+should render a `<slot>` where its child route content belongs:
+
+```js
+const UserLayout = () => html`
+  <main>
+    <header>User area</header>
+    <slot></slot>
+  </main>
 `
-```
 
-A default component export is also supported.
-
-## Plugin Options
-
-```js
-pawaFileRoutes({
-  routesDir: "src/routes",
-  output: "src/routes/generated-routes.js",
-  extensions: [".js", ".ts"]
-})
-```
-
-## Loaders
-
-Export a `loader` from a page or layout module. It runs before the route renders.
-
-```js
-import { html } from "pawajs"
-
-export const loader = async ({ params, query, path, signal }) => {
-  const response = await fetch(`/api/users/${params.id}`, { signal })
-  if (!response.ok) throw new Error("Could not load user")
-  return response.json()
-}
-
-export const UserPage = ({ children }) => html`
-  <article>${children}</article>
+const App = () => html`
+  <router>
+    <route path="/users" name="user-layout" :layout="true">
+      <route path="/:id" name="user"></route>
+    </route>
+  </router>
 `
+
+RegisterComponent(UserLayout)
 ```
 
-Loader results are cached by route path and dynamic route name. The loader receives parsed route parameters, query values, the current path, and an `AbortSignal`.
+The nested route inherits its parent's path, so the example resolves
+`/users/:id`. Route and layout components must be registered with Pawajs under
+the names used by their corresponding `name` props.
 
-## Route Data
-
-Use `useRouteData` inside a page or layout:
+For manual routes, declare a root-level `/404` route to provide the global
+not-found page. Its `name` must match the registered not-found component:
 
 ```js
-import { html } from "pawajs"
-import { useRouteData } from "pawajs-dom-router"
+const GlobalNotFound = () => html`<h1>Page not found</h1>`
 
-export const UserPage = () => {
-  const { data, reload } = useRouteData()
+const App = () => html`
+  <router>
+    <route path="/" name="home"></route>
+    <route path="/404" name="globalNotFound"></route>
+  </router>
+`
 
-  return html`
-    <div if="data">
-      <h1>@{data.name}</h1>
-      <button on-click="reload()">Reload</button>
-    </div>
-  `
-}
+RegisterComponent(GlobalNotFound)
 ```
 
-## Guards
-
-A `guard` can allow navigation, deny it with `false`, or redirect by returning a URL.
-
-```js
-export const guard = async ({ data, allData, params, navigate }) => {
-  if (!data?.user) return "/login"
-  return true
-}
-```
-
-Guard errors and denied navigation are handled by the router. A denied route renders the access-denied fallback; a redirect starts a new navigation.
+The router uses the `/404` path as the fallback for unmatched URLs; the route
+name is used to find the component to render.
 
 ## Navigation
 
-`useRoute` exposes the current location. Its returned state is a Pawajs `State` and is read through `.value`.
+`useRoute()` returns reactive `route`, `params`, `query`, `names`, and `ids`
+states, a `current` matching route record, and a `navigate` function.
+Convenience hooks `useParams()`, `useQuery()`, and `useNavigate()` return the
+corresponding values directly.
 
 ```js
 import { html } from "pawajs"
-import { useRoute } from "pawajs-dom-router"
+import { useNavigate, useRoute } from "@pawajs/router"
 
-export const Navigation = () => {
-  const { current } = useRoute()
-
+const Navigation = () => {
+  const { route } = useRoute()
+  const navigate = useNavigate()
+  useInsert({route,navigate})
   return html`
-    <p>@{current.value.path}</p>
-    <button on-click="current.value.push('/about')">About</button>
+    <p>Current URL: @{route.value}</p>
+    <button on-click="navigate('/about')">About</button>
   `
 }
 ```
 
-`useRouter` exposes the current route parameters and query values for the active route.
-
-## Parallel Routes
-
-Render an independent route slot with `parallel-route`:
+Navigation accepts optional `replace` and `scroll` settings:
 
 ```js
-import { html, RegisterComponent } from "pawajs"
-import { ParallelRoute } from "pawajs-dom-router"
+navigate("/users/42", { replace: true, scroll: false })
+```
 
-RegisterComponent(ParallelRoute)
+The router also registers the `routeLink` attribute plugin for same-origin
+links. It preserves normal browser behavior for modified clicks, downloads,
+external targets, and external links.
 
-export const DashboardPage = () => html`
-  <main>
-    <parallel-route :route="'/favorite'"></parallel-route>
-  </main>
+## Preloading route data
+
+Pass a preload callback to a route. It receives the current URL, params, query,
+and active route names. `useRouteData()` exposes the result as reactive state
+and provides `reload()` and `clearCache()`:
+
+```js
+import { html } from "pawajs"
+import { useRouteData } from "@pawajs/router"
+
+const loadUser = async ({ param, query, route }) => {
+  const response = await fetch(`/api/users/${param.id}?${new URLSearchParams(query)}`)
+  if (!response.ok) throw new Error(`Could not load user for ${route}`)
+  return response.json()
+}
+
+const User = () => {
+  const { data, reload } = useRouteData(loadUser)
+  return html`
+    <article if="data.value">
+      <h1>@{data.value.name}</h1>
+      <button on-click="reload()">Reload</button>
+    </article>
+  `
+}
+
+const App = () => html`
+  <router>
+    <route path="/users/:id" name="user" :preload="loadUser"></route>
+  </router>
 `
 ```
 
-The `route` prop is a Pawajs getter. Most component props in the router use getters; `children` is the direct slot value.
+The `preload` prop may also be `true` for a lazy route whose loaded module
+exports a `preload` function. `reload()` bypasses the cached result. Use
+`clearCache(key)` to remove one cache entry, or `clearCache()` to clear all
+entries for the active route.
 
-## Intercepted Routes
+## Guards
 
-Register `RouteIntercepter` and `InterceptSlot` when a route should render inside an active route:
+A route guard can allow navigation, deny it by returning `false`, or redirect
+by returning a URL string. Guard callbacks receive the same context as preload
+callbacks:
 
 ```js
-import { html, RegisterComponent } from "pawajs"
-import { InterceptSlot, RouteIntercepter } from "pawajs-dom-router"
+const requireLogin = ({ param, route }) => {
+  if (!isLoggedIn()) return "/login"
+  return true
+}
 
-RegisterComponent(RouteIntercepter, InterceptSlot)
-
-export const Layout = ({ children }) => html`
-  <route-intercepter :route="'/favorite'">
-    <div class="modal">
-      <intercept-slot></intercept-slot>
-    </div>
-  </route-intercepter>
-  ${children}
+const App = () => html`
+  <router>
+    <route
+      path="/account/:section"
+      name="account"
+      :guard="requireLogin"
+    ></route>
+  </router>
 `
 ```
 
-## Cache Control
+## Document metadata
 
-Invalidate loader data after a mutation:
+Register `RouteTitle` and `MetaTag` to update the document title and meta tags.
+On the server, these helpers add metadata to the request head when the request
+object is available in the Pawajs component context.
 
 ```js
-import { cache } from "pawajs-dom-router"
+import { html, RegisterComponent } from "pawajs"
+import { RouteTitle, MetaTag } from "@pawajs/router"
 
-cache.invalidate("/users/42", "users")
-cache.invalidateName("users")
-cache.clear()
+const Page = () => html`
+  <div>
+    <route-title value="Account"></route-title>
+    <meta-tag name="description" content="Manage your account"></meta-tag>
+    <h1>Account</h1>
+  </div>
+`
+
+RegisterComponent(RouteTitle, MetaTag, Page)
 ```
-
-The package also exports `invalidateLoader`, `invalidateByName`, and `clearLoaderCache` directly.
 
 ## TypeScript
 
-The package includes declarations in `index.d.ts` and `routePlugin.d.ts`:
+The package exports declarations for the router components, route hook
+contexts, navigation options, route guards and preload callbacks:
 
 ```ts
 import type {
-  RouteDefinition,
-  RouteLoader,
-  RouteGuard
-} from "pawajs-dom-router"
-import type { PawaFileRoutesOptions } from "pawajs-dom-router/routePlugin"
+  RouteGuard,
+  RouteHookContext,
+  RoutePreload,
+  RouteDataOf,
+  UseRouteResult,
+} from "@pawajs/router"
 ```
 
-Pawajs component props are getter-based. For example:
+The router cannot infer the preload type across separate route and page
+components. Pass the preload function's type to `useRouteData` to get its
+resolved return type:
 
 ```ts
-interface UserProps {
-  id: () => string
-  children?: string
+const loadUser = async ({ param }: RouteHookContext) => {
+  const response = await fetch(`/api/users/${param.id}`)
+  return response.json() as Promise<{ id: string; name: string }>
 }
+
+type UserData = RouteDataOf<typeof loadUser>
+const { data } = useRouteData(loadUser)
+// data.value is UserData | undefined
 ```
+
+The argument is only used for type inference; the hook still reads and reloads
+the preload registered for the active route. JavaScript users can pass the
+preload function directly to get editor type hints when using TypeScript-aware
+JavaScript tooling.
 
 ## License
 
 This project is open source and available under the [MIT License](LICENSE).
-
-Built with love for the Pawajs ecosystem. May this router help make building
-fast, expressive Pawajs applications a little more joyful.

@@ -1,524 +1,425 @@
+import { applyNavigation, preloadRoute, prepareNavigation, resolveNavigation, runNavigation } from "./pipeline.js";
+import { navigateTo, startNavigation } from "./navigation.js";
 import {
   $state,
-  components,
   html,
+  lazyComponents,
   RegisterComponent,
-  render,
   runEffect,
   setContext,
-  useAsync,
-  useInsert
-} from "pawajs"
-import { RouteReader } from "./routeReader"
-import { pawaWayRemover } from "pawajs/utils"
-import { RadixRouter } from "./radix"
-import { loadRouteData, runGuards } from "./Fetcher"
-import { ParallelRoute } from "./parallel-route"
-import { InterceptSlot, RouteIntercepter } from "./route-intercept"
-const AccessDeniedPage=()=>{
-  return html `
-    <div>Access denied</div>
-  `
-}
-// ------------------------------------------------------------
-// Route definitions (move this to a separate routes.js later)
-// ------------------------------------------------------------
-let allRoutes=[]
-export const setRoute=(array)=>{
-  allRoutes=array 
-  entry()
-}
-// ------------------------------------------------------------
-// Core maps & radix
-// ------------------------------------------------------------
-export const layoutMap = new Map()
-const notFoundMap = new Map()
-export const routesArray = []
-export const radix = new RadixRouter()
-const generalNotFound = {}
+  useContext,
+  useInnerContext,
+  useInsert,
+  Plugin,
+} from "pawajs";
+import {
+  getRouteDataEntry,
+  loadRouteData,
+  routeDataKey,
+} from "./hooks.js";
+import {
+  createRouteTable,
+  findRouteById,
+  findRouteMatch,
+  matchRoute,
+  normalizeRouteName,
+  routeIdFor,
+  upsertRoute,
+} from "./routing.js";
+import { subscribeHistory } from "./history.js";
+import { setServerMeta, setServerTitle } from "./head.js";
+export { matchRoute };
+export const routerContext = setContext();
+const navigateFromRouter = (to, options = {}) => {
+  const destination = String(to ?? "");
+  
+  if (!destination) return;
+  
+  if (typeof window === "undefined") {
+    const { req } = useInnerContext() ?? {};
+    if (req) req.pawaRedirect = destination;
+    return;
+  }
+navigateTo(destination, options);
+};
 
-const isAbortError = (error) => error?.name === "AbortError"
+export const useRoute = () => {
+  const router = useContext(routerContext);
+  if (!router) throw new Error("useRoute must be called inside a Router");
 
-let historyPatched = false
+  return {
+    route: router.route,
+    params: router.param,
+    query: router.query,
+    names: router.routeNames,
+    ids: router.routeIds,
+    status: router.status,
+    get current() {
+      return findRouteMatch(router.routeTree, router.route.value)?.route;
+    },
+    navigate: navigateFromRouter,
+    preload: (location) => preloadRoute(router, location),
+  };
+};
 
-// ------------------------------------------------------------
-// Build maps + radix tree
-// ------------------------------------------------------------
-const regulateMaps = (route, layout = []) => {
-  if (route?.layout) {
-    const pageLayout = [...layout, route.name]
 
-    layoutMap.set(route.name, {
-      name: route.name,
-      guard: route.guard,
-      page: route.page,
-      notfound: "",
-      layoutChain: pageLayout,
-      paths: []
-    })
+Plugin("routeLink", (el, attr, graph, context) => {
+  if (!el.tagName) return;
+  startNavigation();
 
-    if (route.children) {
-      for (const child of route.children) {
-        regulateMaps(child, pageLayout)
+  const preload = () => {
+    if (!el.hasAttribute("preload")) return;
+    const href = el.getAttribute("href");
+    if (!href || el.hasAttribute("download")) return;
+    if (el.getAttribute("target") && el.getAttribute("target") !== "_self") return;
+    if (el.getAttribute("rel")?.split(/\s+/).includes("external")) return;
+
+    const url = new URL(el.href, location.href);
+    if (url.origin !== location.origin) return;
+
+    context.preloadRoute?.(`${url.pathname}${url.search}`)
+      .catch((error) => console.error("Route preloading failed", error));
+  };
+
+  const onClick = (e) => {
+    if (e.defaultPrevented || e.button !== 0) return;
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+
+    const href = el.getAttribute("href");
+    if (!href) return;
+    if (el.hasAttribute("download")) return;
+
+    const target = el.getAttribute("target");
+    if (target && target !== "_self") return;
+    if (el.getAttribute("rel")?.split(/\s+/).includes("external")) return;
+
+    const url = new URL(el.href, location.href);
+    if (url.origin !== location.origin) return;
+
+    e.preventDefault();
+    navigateTo(url, {
+      replace: el.hasAttribute("replace"),
+      scroll: el.getAttribute("scroll") !== "false",
+    });
+  };
+
+  if (el.getAttribute("target") === "_blank") el.setAttribute("rel", "noopener");
+
+  el.addEventListener("pointerenter", preload);
+  el.addEventListener("focus", preload);
+  el.addEventListener("click", onClick);
+  graph.unMount.push(() => {
+    el.removeEventListener("pointerenter", preload);
+    el.removeEventListener("focus", preload);
+    el.removeEventListener("click", onClick);
+  });
+});
+export const useParams = () => useRoute().params;
+export const useQuery = () => useRoute().query;
+export const useNavigate = () => useRoute().navigate;
+export const useRouteStatus = () => {
+  const router = useContext(routerContext);
+  if (!router) throw new Error("useRouteStatus must be called inside a Router");
+
+  const normalizePath = (location) => {
+    const pathname = new URL(String(location || "/"), "http://pawa.local").pathname;
+    return pathname.replace(/\/+$/, "") || "/";
+  };
+
+  return {
+    get current() {
+      return router.status.value === "pending";
+    },
+    onload(path) {
+      return router.status.value === "pending"
+        && normalizePath(router.pendingLocation.value) === normalizePath(path);
+    },
+  };
+};
+
+
+export const Router = ({ url }) => {
+  const route = $state(url?.() || (typeof window !== "undefined"
+    ? window.location.pathname + window.location.search : "/"));
+  const query = $state({});
+  const param = $state({});
+  const routeNames = $state([]);
+  const routeIds = $state([]);
+  const status = $state("idle");
+  const pendingLocation = $state("");
+
+  const router = {
+    route, query, param, routeNames, routeIds, status, pendingLocation,
+    routeTree: createRouteTable(),
+    routeData: {},
+    version: 0,
+  };
+  routerContext.setValue(router);
+  useInsert({ preloadRoute: (location) => preloadRoute(router, location) });
+
+  runEffect(() => {
+    const pop = () => {
+      const next = window.location.pathname + window.location.search;
+      if (next !== route.value) route.value = next;
+    };
+    return subscribeHistory(window, pop);
+  }, 0);
+
+  let first = true;
+  let transit;
+  runEffect(() => {
+    if (first) { first = false; return; }   // the first navigation belongs to RouteReader
+    router.status.value = "pending";
+    router.pendingLocation.value = route.value;
+
+    runNavigation(router, route.value).then((nav) => {
+      if (nav.version !== router.version) return;           // superseded while loading
+      if (nav.status === "redirect") {
+        return navigateFromRouter(nav.to, { replace: true }); // changes route.value, effect re-runs
       }
-    }
-    return
+      const commit = () => {
+        applyNavigation(router, nav);
+        window.dispatchEvent(new Event("pawa:routed"));
+      };
+      transit?.skipTransition?.();
+      transit = document.startViewTransition ? document.startViewTransition(commit) : (commit(), null);
+    });
+  }, [() => route.value]);
+
+  return html`
+  <template>
+    <slot></slot>
+    <routeReader></routeReader>
+  </template>`;
+};
+ const routeContext = setContext();
+export const Route = ({ path, name, preload, lazy, layout, guard, updateData }) => {
+  let parent = [];
+  let parentRouteIds = [];
+  let inheritPath = "";
+  const router = useContext(routerContext);
+
+  try {
+    const ctx = useContext(routeContext);
+    parent = [...ctx.names];
+    parentRouteIds = [...ctx.routeIds];
+    inheritPath = ctx.paths;
+  } catch (_) {}
+
+  inheritPath += path();
+
+  let CompoLazy = null;
+  if (lazy?.() && name?.()) {
+    CompoLazy = lazyComponents.get(name().toUpperCase());
   }
 
-  if (route?.notfound) {
-    if (layout.length > 0) {
-      const layoutName = layout[layout.length - 1]
-      const entry = layoutMap.get(layoutName)
-      if (entry) entry.notfound = route.name
-      notFoundMap.set(route.name, { name: route.name, page: route.page })
-    } else {
-      generalNotFound.name = route.name
-      generalNotFound.page = route.page
-    }
-    return
-  }
+  const routeName = normalizeRouteName(name?.() ?? "");
+  parent.push(routeName);
+  const routeId = routeIdFor(inheritPath, routeName);
+  const routeIds = [...parentRouteIds, routeId];
+  const routeTree = router.routeTree;
 
-  // Leaf route
-  const routeData = {
-    name: route.name,
-    page: route.page,
-    guard: route.guard,
-    layout: layout || [],
-    path: route.route
-  }
-
-  routesArray.push(routeData)
-  radix.insert(route.route, routeData)
-
-  if (layout?.length) {
-    for (const layoutName of layout) {
-      layoutMap.get(layoutName)?.paths.push(route.route)
-    }
-  }
-}
-
- const entry = () => {
-  for (const route of allRoutes) {
-    regulateMaps(route)
-  }
-}
-
-
-// ------------------------------------------------------------
-// Public match helper
-// ------------------------------------------------------------
-export const matchRoute = (path) => {
-  const [ok, params, routeData, query] = radix.match(path)
-  return [ok, params, query, routeData]
-}
-
-// ------------------------------------------------------------
-// History patching
-// ------------------------------------------------------------
-function enhanceHistoryAPI() {
-  if (historyPatched) return
-  historyPatched = true
-
-  const dispatch = () => window.dispatchEvent(new Event("pushchange"))
-
-  const originalPush = history.pushState
-  const originalReplace = history.replaceState
-
-  history.pushState = function (...args) {
-    originalPush.apply(this, args)
-    dispatch()
-  }
-
-  history.replaceState = function (...args) {
-    originalReplace.apply(this, args)
-    dispatch()
-  }
-
-  window.addEventListener("popstate", dispatch)
-}
-
-// ------------------------------------------------------------
-// Tree comparison
-// ------------------------------------------------------------
-const compareTree = (oldTree = [], newTree = []) => {
-  let thisSame = true
-  let changedOldKey = null
-  let fromNewKey = null
-
-  for (const key in newTree) {
-    if (!thisSame) break
-    if (oldTree[key]?.name !== newTree[key]?.name) {
-      thisSame = false
-      fromNewKey = key
-      changedOldKey = oldTree[key] || null
-    }
-  }
-
-  return { thisSame, fromNewKey, changedOldKey }
-}
-
-// ------------------------------------------------------------
-// Nearest 404
-// ------------------------------------------------------------
-const findNearestNotFound = (path) => {
-  let best = null
-  let bestDepth = -1
-
-  for (const entry of layoutMap.values()) {
-    if (!entry.notfound) continue
-    const depth = entry.layoutChain?.length ?? 0
-    if (depth > bestDepth) {
-      best = entry
-      bestDepth = depth
-    }
-  }
-  return best
-}
-
-// ------------------------------------------------------------
-// Context + global state
-// ------------------------------------------------------------
-export const routeContext = setContext()
-export const isRoute = $state({
-  loading: false,
-  failed: false,
-  msg: ""
-})
-const routeControl=new Map()
-// ------------------------------------------------------------
-// Main Router component
-// ------------------------------------------------------------
-export const Router = async () => {
-  const { $async } = useAsync()
-
-  const loadData = $state({})
-  const intercept = $state(false)
-  const route = $state(window.location.pathname + window.location.search)
-  const retry = $state(false)
-  const routeNames = $state([])
-
-  let liveComponents = []
-  let oldTree = []
-  let enter = false
-  let currentAbort = null
-
-  const routeInstance = {
-    current: [],
-    intercept: [],
-    parallel: []
-  }
-
-  const componentRemover = { remove: null }
-
-  const createErrorTree = (error) => {
-    const message = error?.message || "Failed to load page"
-    const RouteError = () => {
-      useInsert({ retry, message })
-      return html `
-        <div class="route-error" role="alert">
-          <h1>Unable to load this page</h1>
-          <p>@{message}</p>
-          <button on-click="retry.value = !retry.value">Try again</button>
-          <a href="/" route-link>Go home</a>
-        </div>
-      `
-    }
-
-    return [{
-      page: async () => ({ RouteError }),
-      name: "route-error",
-      type: "route",
-      path: ""
-    }]
-  }
-
-  const removeFromLive = (name) => {
-    liveComponents = liveComponents.filter((r) => r.name !== name)
-  }
+  const routeRecord = {
+    id: routeId,
+    name: routeName,
+    layout: !!layout?.(),
+    path: inheritPath,
+    preload: preload?.() ?? null,
+    guard: guard?.() ?? null,
+    updateData: updateData?.() ?? false,
+    lazy: CompoLazy,
+    routeNames: [...parent],
+    routeIds,
+  };
+  upsertRoute(routeTree, routeRecord);
 
   routeContext.setValue({
-    componentRemover,
-    route,
-    routeInstance,
-    routeControl,
-    retry,
-    routesArray,
-    layoutMap,
-    removeFromLive,
-    loadData,
-    intercept,
-    routeNames
-  })
+    names: [...parent],
+    paths: inheritPath,
+    routeIds,
+  });
 
-  // History listener
-  runEffect(() => {
-    enhanceHistoryAPI()
-    const handler = () => {
-      route.value = window.location.pathname + window.location.search
-    }
-    window.addEventListener("pushchange", handler)
-    return () => window.removeEventListener("pushchange", handler)
-  })
-
-  // ---------- Core navigation logic ----------
-  const buildTree = () => {
-    const [matched, params, query, matcher] = matchRoute(route.value)
-    let routeTree = []
-    let lastTree = oldTree
-    let isIntercepted = false
-
-    if (matched && matcher) {
-      // Layouts
-      if (matcher.layout?.length) {
-        for (const name of matcher.layout) {
-          const layout = layoutMap.get(name)
-          if (layout) {
-            routeTree.push({
-              page: layout.page,
-              name: layout.name,
-              type: "layout",
-              path: ""
-            })
-          }
-        }
-      }
-
-      // Page
-      routeTree.push({
-        page: matcher.page,
-        name: matcher.name,
-        type: "route",
-        path: matcher.path
-      })
-
-      // Intercept / parallel (kept simple for now)
-      if (routeInstance.current[0]?.name !== routeTree[0]?.name) {
-        routeInstance.current = [routeTree[0]]
-        routeInstance.intercept = []
-        routeInstance.parallel = []
-      }
-    } else {
-      // 404
-      const nearest = findNearestNotFound(route.value)
-      if (nearest) {
-        for (const layoutName of nearest.layoutChain) {
-          const layout = layoutMap.get(layoutName)
-          if (layout) {
-            routeTree.push({
-              page: layout.page,
-              name: layout.name,
-              type: "layout",
-              path: ""
-            })
-          }
-        }
-        const nf = notFoundMap.get(nearest.notfound)
-        if (nf) {
-          routeTree.push({
-            page: nf.page,
-            name: nf.name,
-            type: "route",
-            path: ""
-          })
-        }
-      } else if (generalNotFound.page) {
-        routeTree.push({
-          page: generalNotFound.page,
-          name: generalNotFound.name,
-          type: "route",
-          path: ""
-        })
-      } else {
-        routeTree.push({
-          page: null,
-          name: "failed",
-          type: "route",
-          path: ""
-        })
-      }
-    }
-
-    const compared = compareTree(lastTree, routeTree)
-    return { routeTree, compared, isIntercepted, params, query }
+  if (layout?.()) {
+    return html`<template><slot></slot></template>`;
   }
 
-  const startAppRoute = async () => {
-    // Cancel previous in-flight loaders
-    if (currentAbort) currentAbort.abort()
-    currentAbort = new AbortController()
-
-    const { routeTree, compared, isIntercepted, params, query } = buildTree()
-
-    let data
-    let guards
-    let guardResult
-    const navigate = (url) => history.pushState({}, "", url)
-
-    try {
-      ({ data, guards } = await loadRouteData({
-        formerTree: oldTree,
-        newTree: routeTree,
-        path: route.value,
-        params,
-        query: query || Object.fromEntries(new URLSearchParams(window.location.search)),
-        signal: currentAbort.signal
-      }))
-
-      guardResult = await runGuards(guards, {
-        params,
-        query: query || Object.fromEntries(new URLSearchParams(window.location.search)),
-        path: route.value,
-        data,
-        navigate
-      })
-    } catch (error) {
-      if (isAbortError(error)) throw error
-
-      const errorTree = createErrorTree(error)
-      const compared = compareTree(oldTree, errorTree)
-      oldTree = errorTree
-      routeNames.value = errorTree.map((item) => item.name)
-      isRoute.value = {
-        loading: false,
-        failed: true,
-        msg: error?.message || "Failed to load page"
-      }
-      console.error("Route navigation failed:", error)
-      return { routeTree: errorTree, compared, isIntercepted: false, failed: true }
-    }
-
-    // Merge loader data
-    loadData.value = { ...loadData.value, ...data }
-
-    let finalTree = routeTree
-
-    if (!guardResult.allowed) {
-      if (guardResult.redirect) {
-        navigate(guardResult.redirect)
-        return { routeTree: [], compared, isIntercepted: false }
-      }
-
-      // Access denied fallback
-      finalTree = [{
-        page: async () => ({ AccessDeniedPage }),
-        name: "access-denied",
-        type: "route",
-        path: ""
-      }]
-    }
-
-    oldTree = finalTree
-    routeNames.value = finalTree.map((r) => r.name)
-
-    return { routeTree: finalTree, compared, isIntercepted }
-  }
-
-  // ---------- Mount + reactive navigation ----------
-  const setup = (el) => {
-    const reader = document.createElement("route-reader")
-    reader.setAttribute(":tree", "tree")
-    reader.setAttribute(":index", "0")
-
-    runEffect(async () => {
-      if (!enter) {
-        enter = true
-        return
-      }
-
-      try {
-        isRoute.value = { loading: true, failed: false, msg: "" }
-
-        const { compared, routeTree, isIntercepted, failed } = await startAppRoute()
-
-        if (isIntercepted) {
-          intercept.value = true
-        }
-
-        if (!compared?.thisSame && compared.changedOldKey) {
-          const routeToBeRemoved = compared.changedOldKey
-          if (!routeToBeRemoved?.name) return
-
-          const entry = routeControl.get(routeToBeRemoved.name)
-          if (!entry) return
-
-          liveComponents = liveComponents.filter(
-            (r) => r.name !== routeToBeRemoved.name
-          )
-
-          await remover(
-            entry.comment,
-            false,
-            null,
-            reader,
-            compared.fromNewKey,
-            componentRemover,
-            routeTree,
-            entry.context
-          )
-        }
-
-        if (!failed) {
-          isRoute.value = { loading: false, failed: false, msg: "" }
-        }
-      } catch (err) {
-        console.error(err,err.message)
-        isRoute.value = {
-          loading: false,
-          failed: true,
-          msg: err?.message || "Failed to load page"
-        }
-      }
-    }, [route, retry])
-  }
-
-  // Initial run
-  await startAppRoute()
-
-  $async(() => useInsert({ setup, oldTree }))
-
-  return html `
-    <main mount="setup($el)">
-      <route-announcer>
-        <route-reader :tree="oldTree" :index="0"></route-reader>
-      </route-announcer>
-    </main>
-  `
-}
-
-// ------------------------------------------------------------
-// DOM swap helper
-// ------------------------------------------------------------
-const remover = async (
-  comment,
-  isFailed = false,
-  announcer,
-  reader,
-  index = 0,
-  compoRemover,
-  tree,
-  context
-) => {
-  reader.setAttribute(":index", index)
-
-  compoRemover.remove = async () => {
-    await pawaWayRemover(comment, comment._endComment)
-    comment._remove?.()
-    comment._endComment?.remove()
-  }
-
-  const newNode = reader.cloneNode(true)
-
-  const doSwap = async () => {
-    comment.parentElement.insertBefore(newNode, comment)
-    render(newNode, { ...context, tree, index })
-    await compoRemover.remove?.()
-  }
-
-  if (document.startViewTransition) {
-    const transition = document.startViewTransition(doSwap)
-    await transition.finished
+  return "";
+};
+const Navigate = ({ url, replace }) => {
+  
+  navigateFromRouter(url(), { replace: replace?.() ?? false });
+  return "";
+};
+const resolveProp = (prop) => typeof prop === "function" ? prop() : prop;
+export const RouteTitle = ({ value, title, text }) => {
+  let nextTitle = resolveProp(value ?? title ?? text) ?? "";
+  const { req } = useInnerContext() ?? {};
+  
+  if (typeof window === "undefined") {
+    setServerTitle(req, nextTitle);
   } else {
-    await doSwap()
+    document.title = String(nextTitle);
   }
+  runEffect(()=>{
+    nextTitle=resolveProp(value ?? title ?? text) ?? ''
+    document.title=String(nextTitle)
+  },{})
+  return "";
+};
+export const MetaTag = ({ name, property, content, httpEquiv, charSet, charset }) => {
+  let attr = {
+    name: resolveProp(name),
+    property: resolveProp(property),
+    content: resolveProp(content),
+    "http-equiv": resolveProp(httpEquiv),
+    charset: resolveProp(charset ?? charSet),
+  };
+  let el
+  const { req } = useInnerContext() ?? {};
+const client=(attributes)=>{
+      const identity = ["name", "property", "http-equiv", "charset"]
+      .find((key) => attributes[key] !== undefined && attributes[key] !== "");
+    if (!identity) return "";
+    const existing = Array.from(document.head.querySelectorAll("meta"))
+      .find((meta) => meta.getAttribute(identity) === String(attributes[identity]));
+    const element = existing ?? document.createElement("meta");
+    for (const [key, attributeValue] of Object.entries(attributes)) {
+      if (attributeValue !== undefined && attributeValue !== null && attributeValue !== "") {
+        element.setAttribute(key, String(attributeValue));
+      }
+    }
+    el=element
+    if (!existing) document.head.append(element);
+
 }
-RegisterComponent('RouteReader',RouteReader,'ParallelRoute',ParallelRoute,'RouteIntercepter',RouteIntercepter,'InterceptSlot',InterceptSlot)
+  if (typeof window === "undefined") {
+    setServerMeta(req, attr);
+  } else {
+    client(attr)
+  }
+  runEffect(()=>{
+    return ()=>{
+      if (el) {
+        el.remove()
+      }
+    }
+  })
+  runEffect(()=>{
+     attr = {
+    name: resolveProp(name),
+    property: resolveProp(property),
+    content: resolveProp(content),
+    "http-equiv": resolveProp(httpEquiv),
+    charset: resolveProp(charset ?? charSet),
+  };
+  client(attr)
+  
+  },{})
+  return "";
+};
+const RouteReader = () => {
+  const router = useContext(routerContext);
+  const nav = prepareNavigation(router, router.route.value);
+  const start = async () => {
+    const result = await resolveNavigation(router, nav);
+    if (!applyNavigation(router, result)) return { status: "superseded" };
+    return result;
+  };
+
+  const { routeIds, routeNames } = router;
+  useInsert({ start, routeIds, routeNames });
+  return html
+  `
+    <template await="start" as="result" no-stream>
+      <template if="result.status === 'redirect'">
+        <navigate :url="result.to" :replace="true"></navigate>
+      </template>
+      <template if="result.status === 'ok' || (result.status === 'notfound' && routeIds.value.length)">
+        <route-view key="routeIds.value[0]" :route-id="routeIds.value[0]" :name="routeNames.value[0]" :index="0"></route-view>
+      </template>
+      <template if="result.status === 'blocked'">
+        <div>Navigation blocked</div>
+      </template>
+      <template if="result.status === 'error'">
+        <div>Unable to resolve route</div>
+      </template>
+    </template>
+    <template as-catch>
+      <div>Unable to resolve route</div>
+    </template>
+  `
+  ;
+};
+
+const routeViewContext=setContext()
+export const useRouteData=(_preload)=>{
+  const ctx=useContext(routeViewContext)
+  const router=ctx.router
+  const key=routeDataKey(router.param.value,router.query.value)
+  const entry=getRouteDataEntry(router.routeData,ctx.routeId)
+  
+  const data=$state(async()=>{
+    const cached = entry.cache.get(key);
+    if (cached?.loaded) {
+      return cached.data;
+    }else if (entry.loaded && entry.key === key) {
+      return entry.data;
+    }else{
+      return await ctx.preloadRoute()
+    }
+  },ctx.routeId)
+  const update=(newData,dataKey=entry.key)=>{
+    entry.data=newData
+    entry.key=dataKey
+    entry.loaded=true
+    const cache=entry.cache.get(dataKey)
+    if (cache) {
+      cache.data=newData
+      cache.loaded=true
+    }
+    if (routeDataKey(router.param.value,router.query.value)===dataKey) data.value=newData
+  }
+  const setData=(newData)=>{
+     data.value=newData
+  }
+  entry.update=update
+  entry.setData=setData
+  runEffect(()=>{
+    return ()=>{
+      if (entry?.update===update) entry.update=null
+      if (entry?.setData===setData) entry.setData=null
+      if(router.routeData[ctx.routeId]?.data ) router.routeData[ctx.routeId].data=null 
+    }
+  })
+  const reload=async()=>{
+    const dat=await ctx.preloadRoute(true)
+    return dat
+  }
+  const clearCache=(string)=>{
+    if (string) {
+      entry.cache.delete(string)
+    }else{
+      entry.cache.clear()
+    }
+  }
+  return {data,reload,clearCache}
+}
+const RouteView =async ({ name, routeId, index }) => {
+  const router = useContext(routerContext);
+  const { routeNames, routeIds, routeTree } = router;
+  const routes = findRouteById(routeTree, routeId());
+  const layout = routes?.layout;
+  const next = () => routeNames.value[index() + 1];
+  const preloadRoute = (force = false) =>
+    loadRouteData(routes, router, routes.routeNames, force);
+  routeViewContext.setValue({preloadRoute,routeId:routeId(),name:name(),router}) 
+  
+  const routeView = `<${name()}>
+    ${layout && routeIds.value[index() + 1] ? `<route-view key="routeIds.value[${index() + 1}]" :route-id="routeIds.value[${index() + 1}]" :name="routeNames.value[${index() + 1}]" :index="${index() + 1}"></route-view>` : ""}
+  </${name()}>`;
+  
+  useInsert({ routeNames, next, preloadRoute, routeIds });
+  return routeView;
+};
+
+RegisterComponent("RouteReader",RouteReader,"RouteView", RouteView, "Navigate",Navigate, "RouteTitle",RouteTitle, "MetaTag",MetaTag);

@@ -1,10 +1,11 @@
 {
-  "name": "pawajs-dom-router",
-  "version": "0.1.0-beta",
+  "name": "@pawajs/router",
+  "version": "0.1.0-beta.1",
   "description": "Pawajs dom router for spa apps",
   "keywords": [
     "pawajs",
     "spa",
+    "ssr",
     "router",
     "frontend",
     "ui"
@@ -27,23 +28,23 @@
       "types": "./index.d.ts",
       "import": "./index.js"
     },
-    "./routePlugin": {
-      "types": "./routePlugin.d.ts",
-      "import": "./routePlugin.js"
+    "./vite": {
+      "types": "./vite.d.ts",
+      "import": "./vite.js"
+    },
+    "./filesystem": {
+      "types": "./filesystem.d.ts",
+      "import": "./filesystem.js"
     },
     "./package.json": "./package.json"
   },
-  "files": [
-    "index.js",
-    "index.d.ts",
-    "routePlugin.js",
-    "routePlugin.d.ts",
-    "src",
-    "README.md",
-    "LICENSE"
-  ],
   "peerDependencies": {
-    "pawajs": "^2.4.0-beta.2",
+    "pawajs": "^2.4.1-beta.1",
     "vite": "^8.2.0"
+  },
+  "peerDependenciesMeta": {
+    "vite": {
+      "optional": true
+    }
   }
 }
